@@ -4,7 +4,7 @@ This source integrates with AWS, allowing Overmind to pull data about many types
 
 ## Required Permissions
 
-This source requies the following IAM Policy
+This source requires the following IAM Policy
 
 ```json
 {
@@ -18,6 +18,7 @@ This source requies the following IAM Policy
         "cloudfront:List*",
         "cloudwatch:Describe*",
         "cloudwatch:ListTagsForResource",
+        "directconnect:Describe*",
         "dynamodb:Describe*",
         "dynamodb:List*",
         "ec2:Describe*",
@@ -33,12 +34,19 @@ This source requies the following IAM Policy
         "lambda:List*",
         "network-firewall:Describe*",
         "network-firewall:List*",
+        "networkmanager:Describe*",
+        "networkmanager:Get*",
+        "networkmanager:List*",
         "rds:Describe*",
         "rds:ListTagsForResource",
         "route53:Get*",
         "route53:List*",
         "s3:GetBucket*",
-        "s3:ListAllMyBuckets"
+        "s3:ListAllMyBuckets",
+        "sns:Get*",
+        "sns:List*",
+        "sqs:Get*",
+        "sqs:List*"
       ],
       "Resource": "*"
     }
@@ -60,6 +68,8 @@ Meaning that the type in Overmind should be:
 ec2-security-group
 ```
 
+Note that plurals should be converted to their singular form hence `security-groups` becomes `security-group`
+
 ## Rate limiting
 
 For EC2 APIs this sources uses the [same throttling methods as EC2 does](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/throttling.html), with the bucket size and refill rate set to 50% of the total. This means that the source will never use more than 50% of the available requests, including refil;ls when the bucket is empty.
@@ -79,11 +89,12 @@ All configuration options can be provided via the command line or as environment
 | `MAX_PARALLEL`          | `--max-parallel`          | ✅         | Max number of requests to run in parallel                                                                                                                                                             |
 | `AUTO_CONFIG`           | `--auto-config`           |           | Use the local AWS config, the same as the AWS CLI could use. This can be set up with `aws configure`                                                                                                  |
 | `AWS_REGIONS`           | `--aws-region`            |           | Comma-separated list of AWS regions that this source should operate in                                                                                                                                |
-| `AWS_ACCESS_STRATEGY`   | `--aws-access-strategy`   |           | The strategy to use to access this customer's AWS account. Valid values: 'access-key', 'external-id'. Default: 'access-key'.                                                                          |
+| `AWS_ACCESS_STRATEGY`   | `--aws-access-strategy`   |           | The strategy to use to access this customer's AWS account. Valid values: 'access-key', 'external-id', 'sso-profile', 'defaults'. Default: 'defaults'.                                                 |
 | `AWS_ACCESS_KEY_ID`     | `--aws-access-key-id`     |           | The ID of the access key to use                                                                                                                                                                       |
 | `AWS_SECRET_ACCESS_KEY` | `--aws-secret-access-key` |           | The secret access key to use for auth                                                                                                                                                                 |
 | `AWS_EXTERNAL_ID`       | `--aws-external-id`       |           | The external ID to use when assuming the customer's role                                                                                                                                              |
 | `AWS_TARGET_ROLE_ARN`   | `--aws-target-role-arn`   |           | The role to assume in the customer's account                                                                                                                                                          |
+| `AWS_PROFILE`           | `--aws-profile`           |           | The AWS SSO Profile to use. Defaults to $AWS_PROFILE, then whatever the AWS SDK's SSO config defaults to                                                                                              |
 
 ### `srcman` config
 

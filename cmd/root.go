@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/overmindtech/aws-source/sources/sns"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,9 +35,11 @@ import (
 	"github.com/overmindtech/aws-source/sources/iam"
 	"github.com/overmindtech/aws-source/sources/lambda"
 	"github.com/overmindtech/aws-source/sources/networkfirewall"
+	"github.com/overmindtech/aws-source/sources/networkmanager"
 	"github.com/overmindtech/aws-source/sources/rds"
 	"github.com/overmindtech/aws-source/sources/route53"
 	"github.com/overmindtech/aws-source/sources/s3"
+	"github.com/overmindtech/aws-source/sources/sqs"
 	"github.com/overmindtech/aws-source/tracing"
 	"github.com/overmindtech/discovery"
 	"github.com/overmindtech/sdp-go/auth"
@@ -67,6 +70,8 @@ var rootCmd = &cobra.Command{
 			}
 		}()
 
+		var err error
+
 		// Get srcman supplied config
 		natsServers := viper.GetStringSlice("nats-servers")
 		natsNamePrefix := viper.GetString("nats-name-prefix")
@@ -75,30 +80,27 @@ var rootCmd = &cobra.Command{
 		maxParallel := viper.GetInt("max-parallel")
 		apiKey := viper.GetString("api-key")
 		apiPath := viper.GetString("api-path")
+		healthCheckPort := viper.GetInt("health-check-port")
+
 		hostname, err := os.Hostname()
-
 		if err != nil {
-			log.WithFields(log.Fields{
-				"error": err,
-			}).Error("Could not determine hostname for use in NATS connection name")
+			log.WithError(err).Fatal("Could not determine hostname for use in NATS connection name")
+		}
 
-			os.Exit(1)
+		awsAuthConfig := AwsAuthConfig{
+			Strategy:        viper.GetString("aws-access-strategy"),
+			AccessKeyID:     viper.GetString("aws-access-key-id"),
+			SecretAccessKey: viper.GetString("aws-secret-access-key"),
+			ExternalID:      viper.GetString("aws-external-id"),
+			TargetRoleARN:   viper.GetString("aws-target-role-arn"),
+			Profile:         viper.GetString("aws-profile"),
+			AutoConfig:      viper.GetBool("auto-config"),
 		}
 
 		var regions []string
-		viper.UnmarshalKey("aws-regions", &regions)
-
-		strategy := viper.GetString("aws-access-strategy")
-		accessKeyID := viper.GetString("aws-access-key-id")
-		secretAccessKey := viper.GetString("aws-secret-access-key")
-		externalID := viper.GetString("aws-external-id")
-		targetRoleARN := viper.GetString("aws-target-role-arn")
-		autoConfig := viper.GetBool("auto-config")
-		healthCheckPort := viper.GetInt("health-check-port")
+		viper.UnmarshalKey("aws-regions", &awsAuthConfig.Regions)
 
 		var natsNKeySeedLog string
-		var tokenClient auth.TokenClient
-
 		if natsNKeySeed != "" {
 			natsNKeySeedLog = "[REDACTED]"
 		}
@@ -110,15 +112,17 @@ var rootCmd = &cobra.Command{
 			"nats-nkey-seed":      natsNKeySeedLog,
 			"max-parallel":        maxParallel,
 			"aws-regions":         regions,
-			"aws-access-strategy": strategy,
-			"aws-external-id":     externalID,
-			"aws-target-role-arn": targetRoleARN,
-			"auto-config":         autoConfig,
+			"aws-access-strategy": awsAuthConfig.Strategy,
+			"aws-external-id":     awsAuthConfig.ExternalID,
+			"aws-target-role-arn": awsAuthConfig.TargetRoleARN,
+			"aws-profile":         awsAuthConfig.Profile,
+			"auto-config":         awsAuthConfig.AutoConfig,
 			"health-check-port":   healthCheckPort,
 		}).Info("Got config")
 
 		// Validate the auth params and create a token client if we are using
 		// auth
+		var tokenClient auth.TokenClient
 		if apiKey != "" {
 			tokenClient, err = auth.NewAPIKeyClient(apiPath, apiKey)
 
@@ -128,25 +132,14 @@ var rootCmd = &cobra.Command{
 				log.WithError(err).Fatal("Could not create API key client")
 			}
 		} else if natsJWT != "" || natsNKeySeed != "" {
-			var err error
-
 			tokenClient, err = createTokenClient(natsJWT, natsNKeySeed)
 
 			if err != nil {
-				log.WithFields(log.Fields{
-					"error": err.Error(),
-				}).Fatal("Error validating authentication info")
+				log.WithError(err).Fatal("Error validating NATS authentication info")
 			}
 		}
 
-		e, err := discovery.NewEngine()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error": err.Error(),
-			}).Fatal("Error initializing Engine")
-		}
-		e.Name = "aws-source"
-		e.NATSOptions = &auth.NATSOptions{
+		natsOptions := auth.NATSOptions{
 			NumRetries:        -1,
 			RetryDelay:        5 * time.Second,
 			Servers:           natsServers,
@@ -157,228 +150,11 @@ var rootCmd = &cobra.Command{
 			ReconnectJitter:   1 * time.Second,
 			TokenClient:       tokenClient,
 		}
-		e.MaxParallelExecutions = maxParallel
 
-		if len(regions) == 0 {
-			log.Fatal("No regions specified")
-		}
-
-		var globalDone bool
-
-		for _, region := range regions {
-			region = strings.Trim(region, " ")
-
-			configCtx, configCancel := context.WithTimeout(context.Background(), 10*time.Second)
-
-			cfg, err := getAWSConfig(strategy, region, accessKeyID, secretAccessKey, externalID, targetRoleARN, autoConfig)
-
-			if err != nil {
-				log.WithFields(log.Fields{
-					"error": err,
-				}).Fatal("Error loading config")
-			}
-
-			if log.GetLevel() == log.TraceLevel {
-				// Add OTel instrumentation
-				cfg.HTTPClient = &http.Client{
-					Transport: otelhttp.NewTransport(http.DefaultTransport),
-				}
-			}
-
-			// Work out what account we're using. This will be used in item scopes
-			stsClient := sts.NewFromConfig(cfg)
-
-			var callerID *sts.GetCallerIdentityOutput
-
-			callerID, err = stsClient.GetCallerIdentity(configCtx, &sts.GetCallerIdentityInput{})
-
-			if err != nil {
-				log.WithFields(log.Fields{
-					"error":         err,
-					"region":        region,
-					"targetRoleARN": targetRoleARN,
-					"externalID":    externalID,
-				}).Fatal("Error retrieving account information")
-			}
-
-			// Cancel config load context and release resources
-			configCancel()
-
-			// Create an EC2 rate limit which limits the source to 50% of the
-			// overall rate limit
-			ec2RateLimit := sources.LimitBucket{
-				MaxCapacity: 50,
-				RefillRate:  10,
-			}
-
-			// Apparently Autoscaling has a separate bucket to EC2 but I'm going
-			// to assume the values are the same, the documentation for rate
-			// limiting for everything other than EC2 is very poor
-			autoScalingRateLimit := sources.LimitBucket{
-				MaxCapacity: 50,
-				RefillRate:  10,
-			}
-
-			// IAM's rate limit is 20 per second, so we'll use 50% of that at
-			// maximum. See:
-			// https://docs.aws.amazon.com/singlesignon/latest/userguide/limits.html
-			iamRateLimit := sources.LimitBucket{
-				MaxCapacity: 10,
-				RefillRate:  10,
-			}
-
-			rateLimitCtx, rateLimitCancel := context.WithCancel(context.Background())
-			defer rateLimitCancel()
-
-			ec2RateLimit.Start(rateLimitCtx)
-			autoScalingRateLimit.Start(rateLimitCtx)
-			iamRateLimit.Start(rateLimitCtx)
-
-			sources := []discovery.Source{
-				// EC2
-				ec2.NewAddressSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewCapacityReservationFleetSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewCapacityReservationSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewEgressOnlyInternetGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewIamInstanceProfileAssociationSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewImageSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewInstanceEventWindowSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewInstanceSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewInstanceStatusSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewInternetGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewKeyPairSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewLaunchTemplateSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewLaunchTemplateVersionSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewNatGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewNetworkAclSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewNetworkInterfacePermissionSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewNetworkInterfaceSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewPlacementGroupSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewReservedInstanceSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewRouteTableSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewSecurityGroupSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewSnapshotSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewSubnetSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewVolumeSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewVolumeStatusSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewVpcPeeringConnectionSource(cfg, *callerID.Account, &ec2RateLimit),
-				ec2.NewVpcSource(cfg, *callerID.Account, &ec2RateLimit),
-
-				// EFS (I'm assuming it shares its rate limit with EC2))
-				efs.NewAccessPointSource(cfg, *callerID.Account, &ec2RateLimit),
-				efs.NewBackupPolicySource(cfg, *callerID.Account, &ec2RateLimit),
-				efs.NewFileSystemSource(cfg, *callerID.Account, &ec2RateLimit),
-				efs.NewMountTargetSource(cfg, *callerID.Account, &ec2RateLimit),
-				efs.NewReplicationConfigurationSource(cfg, *callerID.Account, &ec2RateLimit),
-
-				// EKS
-				eks.NewAddonSource(cfg, *callerID.Account, region),
-				eks.NewClusterSource(cfg, *callerID.Account, region),
-				eks.NewFargateProfileSource(cfg, *callerID.Account, region),
-				eks.NewNodegroupSource(cfg, *callerID.Account, region),
-
-				// Route 53
-				route53.NewHealthCheckSource(cfg, *callerID.Account, region),
-				route53.NewHostedZoneSource(cfg, *callerID.Account, region),
-				route53.NewResourceRecordSetSource(cfg, *callerID.Account, region),
-
-				// Cloudwatch
-				cloudwatch.NewAlarmSource(cfg, *callerID.Account),
-
-				// IAM
-				iam.NewGroupSource(cfg, *callerID.Account, region, &iamRateLimit),
-				iam.NewInstanceProfileSource(cfg, *callerID.Account, region, &iamRateLimit),
-				iam.NewPolicySource(cfg, *callerID.Account, region, &iamRateLimit),
-				iam.NewRoleSource(cfg, *callerID.Account, region, &iamRateLimit),
-				iam.NewUserSource(cfg, *callerID.Account, region, &iamRateLimit),
-
-				// Lambda
-				lambda.NewFunctionSource(cfg, *callerID.Account, region),
-				lambda.NewLayerSource(cfg, *callerID.Account, region),
-				lambda.NewLayerVersionSource(cfg, *callerID.Account, region),
-
-				// ECS
-				ecs.NewCapacityProviderSource(cfg, *callerID.Account),
-				ecs.NewClusterSource(cfg, *callerID.Account, region),
-				ecs.NewContainerInstanceSource(cfg, *callerID.Account, region),
-				ecs.NewServiceSource(cfg, *callerID.Account, region),
-				ecs.NewTaskDefinitionSource(cfg, *callerID.Account, region),
-				ecs.NewTaskSource(cfg, *callerID.Account, region),
-
-				// DynamoDB
-				dynamodb.NewBackupSource(cfg, *callerID.Account, region),
-				dynamodb.NewTableSource(cfg, *callerID.Account, region),
-
-				// RDS
-				rds.NewDBClusterParameterGroupSource(cfg, *callerID.Account, region),
-				rds.NewDBClusterSource(cfg, *callerID.Account),
-				rds.NewDBInstanceSource(cfg, *callerID.Account),
-				rds.NewDBParameterGroupSource(cfg, *callerID.Account, region),
-				rds.NewDBSubnetGroupSource(cfg, *callerID.Account),
-				rds.NewOptionGroupSource(cfg, *callerID.Account),
-
-				// Autoscaling
-				autoscaling.NewAutoScalingGroupSource(cfg, *callerID.Account, &autoScalingRateLimit),
-
-				// ELB
-				elb.NewInstanceHealthSource(cfg, *callerID.Account),
-				elb.NewLoadBalancerSource(cfg, *callerID.Account),
-
-				// ELBv2
-				elbv2.NewListenerSource(cfg, *callerID.Account),
-				elbv2.NewLoadBalancerSource(cfg, *callerID.Account),
-				elbv2.NewRuleSource(cfg, *callerID.Account),
-				elbv2.NewTargetGroupSource(cfg, *callerID.Account),
-				elbv2.NewTargetHealthSource(cfg, *callerID.Account),
-
-				// Network Firewall
-				networkfirewall.NewFirewallSource(cfg, *callerID.Account, region),
-				networkfirewall.NewFirewallPolicySource(cfg, *callerID.Account, region),
-				networkfirewall.NewRuleGroupSource(cfg, *callerID.Account, region),
-				networkfirewall.NewTLSInspectionConfigurationSource(cfg, *callerID.Account, region),
-
-				// Direct Connect
-				directconnect.NewDirectConnectGatewaySource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewDirectConnectGatewayAssociationSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewDirectConnectGatewayAssociationProposalSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewConnectionSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewDirectConnectGatewayAttachmentSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewVirtualInterfaceSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewVirtualGatewaySource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewCustomerMetadataSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewLagSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewLocationSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewHostedConnectionSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewInterconnectSource(cfg, *callerID.Account, &autoScalingRateLimit),
-				directconnect.NewRouterConfigurationSource(cfg, *callerID.Account, &autoScalingRateLimit),
-			}
-
-			e.AddSources(sources...)
-
-			// Add "global" sources (those that aren't tied to a region, like
-			// cloudfront). but only do this once for the first region. For
-			// these APIs it doesn't matter which region we call them from, we
-			// get global results
-			if !globalDone {
-				e.AddSources(
-					// Cloudfront
-					cloudfront.NewCachePolicySource(cfg, *callerID.Account),
-					cloudfront.NewContinuousDeploymentPolicySource(cfg, *callerID.Account),
-					cloudfront.NewDistributionSource(cfg, *callerID.Account),
-					cloudfront.NewFunctionSource(cfg, *callerID.Account),
-					cloudfront.NewKeyGroupSource(cfg, *callerID.Account),
-					cloudfront.NewOriginAccessControlSource(cfg, *callerID.Account),
-					cloudfront.NewOriginRequestPolicySource(cfg, *callerID.Account),
-					cloudfront.NewResponseHeadersPolicySource(cfg, *callerID.Account),
-					cloudfront.NewRealtimeLogConfigsSource(cfg, *callerID.Account),
-					cloudfront.NewStreamingDistributionSource(cfg, *callerID.Account),
-
-					// S3
-					s3.NewS3Source(cfg, *callerID.Account),
-				)
-				globalDone = true
-			}
-
+		e, err := InitializeAwsSourceEngine(natsOptions, awsAuthConfig, maxParallel)
+		if err != nil {
+			log.WithError(err).Error("Could not initialize aws source")
+			return
 		}
 
 		// Start HTTP server for status
@@ -470,16 +246,24 @@ func init() {
 	rootCmd.PersistentFlags().String("nats-name-prefix", "", "A name label prefix. Sources should append a dot and their hostname .{hostname} to this, then set this is the NATS connection name which will be sent to the server on CONNECT to identify the client")
 	rootCmd.PersistentFlags().String("nats-jwt", "", "The JWT token that should be used to authenticate to NATS, provided in raw format e.g. eyJ0eXAiOiJKV1Q...")
 	rootCmd.PersistentFlags().String("nats-nkey-seed", "", "The NKey seed which corresponds to the NATS JWT e.g. SUAFK6QUC...")
+
 	rootCmd.PersistentFlags().String("api-key", "", "The API key to use to authenticate to the Overmind API")
+	// Support API Keys in the environment
+	err := viper.BindEnv("api-key", "OVM_API_KEY", "API_KEY")
+	if err != nil {
+		log.WithError(err).Fatal("could not bind api key to env")
+	}
+
 	rootCmd.PersistentFlags().String("api-path", "https://api.prod.overmind.tech", "The URL of the Overmind API")
 	rootCmd.PersistentFlags().Int("max-parallel", 2_000, "Max number of requests to run in parallel")
 
 	// Custom flags for this source
-	rootCmd.PersistentFlags().String("aws-access-strategy", "access-key", "The strategy to use to access this customer's AWS account. Valid values: 'access-key', 'external-id'. Default: 'access-key'.")
+	rootCmd.PersistentFlags().String("aws-access-strategy", "defaults", "The strategy to use to access this customer's AWS account. Valid values: 'access-key', 'external-id', 'sso-profile', 'defaults'. Default: 'defaults'.")
 	rootCmd.PersistentFlags().String("aws-access-key-id", "", "The ID of the access key to use")
 	rootCmd.PersistentFlags().String("aws-secret-access-key", "", "The secret access key to use for auth")
 	rootCmd.PersistentFlags().String("aws-external-id", "", "The external ID to use when assuming the customer's role")
 	rootCmd.PersistentFlags().String("aws-target-role-arn", "", "The role to assume in the customer's account")
+	rootCmd.PersistentFlags().String("aws-profile", "", "The AWS SSO Profile to use. Defaults to $AWS_PROFILE, then whatever the AWS SDK's SSO config defaults to")
 	rootCmd.PersistentFlags().String("aws-regions", "", "Comma-separated list of AWS regions that this source should operate in")
 	rootCmd.PersistentFlags().BoolP("auto-config", "a", false, "Use the local AWS config, the same as the AWS CLI could use. This can be set up with \"aws configure\"")
 	rootCmd.PersistentFlags().IntP("health-check-port", "", 8080, "The port that the health check should run on")
@@ -546,7 +330,24 @@ func initConfig() {
 	}
 }
 
-func getAWSConfig(strategy, region, accessKeyID, secretAccessKey, externalID, roleARN string, autoConfig bool) (aws.Config, error) {
+type AwsAuthConfig struct {
+	Strategy        string
+	AccessKeyID     string
+	SecretAccessKey string
+	ExternalID      string
+	TargetRoleARN   string
+	Profile         string
+	AutoConfig      bool
+
+	Regions []string
+}
+
+func (c AwsAuthConfig) GetAWSConfig(region string) (aws.Config, error) {
+	// Validate inputs
+	if region == "" {
+		return aws.Config{}, errors.New("aws-region cannot be blank")
+	}
+
 	ctx := context.Background()
 
 	options := []func(*config.LoadOptions) error{
@@ -554,46 +355,52 @@ func getAWSConfig(strategy, region, accessKeyID, secretAccessKey, externalID, ro
 		config.WithAppID("Overmind"),
 	}
 
-	if autoConfig {
+	if c.AutoConfig {
+		if c.Strategy != "defaults" {
+			log.WithField("aws-access-strategy", c.Strategy).Warn("auto-config is set to true, but aws-access-strategy is not set to 'defaults'. This may cause unexpected behaviour")
+		}
 		return config.LoadDefaultConfig(ctx, options...)
 	}
 
-	// Validate inputs
-	if region == "" {
-		return aws.Config{}, errors.New("aws-region cannot be blank")
-	}
-
-	if strategy == "access-key" {
-		if accessKeyID == "" {
+	if c.Strategy == "defaults" {
+		return config.LoadDefaultConfig(ctx, options...)
+	} else if c.Strategy == "access-key" {
+		if c.AccessKeyID == "" {
 			return aws.Config{}, errors.New("with access-key strategy, aws-access-key-id cannot be blank")
 		}
-		if secretAccessKey == "" {
+		if c.SecretAccessKey == "" {
 			return aws.Config{}, errors.New("with access-key strategy, aws-secret-access-key cannot be blank")
 		}
-		if externalID != "" {
+		if c.ExternalID != "" {
 			return aws.Config{}, errors.New("with access-key strategy, aws-external-id must be blank")
 		}
-		if roleARN != "" {
+		if c.TargetRoleARN != "" {
 			return aws.Config{}, errors.New("with access-key strategy, aws-target-role-arn must be blank")
+		}
+		if c.Profile != "" {
+			return aws.Config{}, errors.New("with access-key strategy, aws-profile must be blank")
 		}
 
 		options = append(options, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, ""),
+			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
 		))
 
 		return config.LoadDefaultConfig(ctx, options...)
-	} else if strategy == "external-id" {
-		if accessKeyID != "" {
+	} else if c.Strategy == "external-id" {
+		if c.AccessKeyID != "" {
 			return aws.Config{}, errors.New("with external-id strategy, aws-access-key-id must be blank")
 		}
-		if secretAccessKey != "" {
+		if c.SecretAccessKey != "" {
 			return aws.Config{}, errors.New("with external-id strategy, aws-secret-access-key must be blank")
 		}
-		if externalID == "" {
+		if c.ExternalID == "" {
 			return aws.Config{}, errors.New("with external-id strategy, aws-external-id cannot be blank")
 		}
-		if roleARN == "" {
+		if c.TargetRoleARN == "" {
 			return aws.Config{}, errors.New("with external-id strategy, aws-target-role-arn cannot be blank")
+		}
+		if c.Profile != "" {
+			return aws.Config{}, errors.New("with external-id strategy, aws-profile must be blank")
 		}
 
 		assumecnf, err := config.LoadDefaultConfig(ctx)
@@ -604,12 +411,32 @@ func getAWSConfig(strategy, region, accessKeyID, secretAccessKey, externalID, ro
 		options = append(options, config.WithCredentialsProvider(aws.NewCredentialsCache(
 			stscredsv2.NewAssumeRoleProvider(
 				sts.NewFromConfig(assumecnf),
-				roleARN,
+				c.TargetRoleARN,
 				func(aro *stscredsv2.AssumeRoleOptions) {
-					aro.ExternalID = &externalID
+					aro.ExternalID = &c.ExternalID
 				},
 			)),
 		))
+
+		return config.LoadDefaultConfig(ctx, options...)
+	} else if c.Strategy == "sso-profile" {
+		if c.AccessKeyID != "" {
+			return aws.Config{}, errors.New("with sso-profile strategy, aws-access-key-id must be blank")
+		}
+		if c.SecretAccessKey != "" {
+			return aws.Config{}, errors.New("with sso-profile strategy, aws-secret-access-key must be blank")
+		}
+		if c.ExternalID != "" {
+			return aws.Config{}, errors.New("with sso-profile strategy, aws-external-id must be blank")
+		}
+		if c.TargetRoleARN != "" {
+			return aws.Config{}, errors.New("with sso-profile strategy, aws-target-role-arn must be blank")
+		}
+		if c.Profile == "" {
+			return aws.Config{}, errors.New("with sso-profile strategy, aws-profile cannot be blank")
+		}
+
+		options = append(options, config.WithSharedConfigProfile(c.Profile))
 
 		return config.LoadDefaultConfig(ctx, options...)
 	} else {
@@ -667,4 +494,263 @@ func (t TerminationLogHook) Fire(e *log.Entry) error {
 	_, err = tLog.WriteString(message)
 
 	return err
+}
+
+func InitializeAwsSourceEngine(natsOptions auth.NATSOptions, awsAuthConfig AwsAuthConfig, maxParallel int) (*discovery.Engine, error) {
+	e, err := discovery.NewEngine()
+	if err != nil {
+		return nil, fmt.Errorf("error initializing Engine: %w", err)
+	}
+
+	e.Name = "aws-source"
+	e.NATSOptions = &natsOptions
+	e.MaxParallelExecutions = maxParallel
+
+	if len(awsAuthConfig.Regions) == 0 {
+		log.Fatal("No regions specified")
+	}
+
+	var globalDone bool
+
+	for _, region := range awsAuthConfig.Regions {
+		region = strings.Trim(region, " ")
+
+		configCtx, configCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer configCancel()
+
+		cfg, err := awsAuthConfig.GetAWSConfig(region)
+		if err != nil {
+			configCancel()
+			return nil, fmt.Errorf("error getting AWS config for region %v: %w", region, err)
+		}
+
+		if log.GetLevel() == log.TraceLevel {
+			// Add OTel instrumentation
+			cfg.HTTPClient = &http.Client{
+				Transport: otelhttp.NewTransport(http.DefaultTransport),
+			}
+		}
+
+		// Work out what account we're using. This will be used in item scopes
+		stsClient := sts.NewFromConfig(cfg)
+
+		callerID, err := stsClient.GetCallerIdentity(configCtx, &sts.GetCallerIdentityInput{})
+		if err != nil {
+			lf := log.Fields{
+				"region":   region,
+				"strategy": awsAuthConfig.Strategy,
+			}
+			if awsAuthConfig.TargetRoleARN != "" {
+				lf["targetRoleARN"] = awsAuthConfig.TargetRoleARN
+				lf["externalID"] = awsAuthConfig.ExternalID
+			}
+			log.WithError(err).WithFields(lf).Fatal("Error retrieving account information")
+		}
+
+		// Create an EC2 rate limit which limits the source to 50% of the
+		// overall rate limit
+		ec2RateLimit := sources.LimitBucket{
+			MaxCapacity: 50,
+			RefillRate:  10,
+		}
+
+		// Apparently Autoscaling has a separate bucket to EC2 but I'm going
+		// to assume the values are the same, the documentation for rate
+		// limiting for everything other than EC2 is very poor
+		autoScalingRateLimit := sources.LimitBucket{
+			MaxCapacity: 50,
+			RefillRate:  10,
+		}
+
+		// IAM's rate limit is 20 per second, so we'll use 50% of that at
+		// maximum. See:
+		// https://docs.aws.amazon.com/singlesignon/latest/userguide/limits.html
+		iamRateLimit := sources.LimitBucket{
+			MaxCapacity: 10,
+			RefillRate:  10,
+		}
+
+		directConnectRateLimit := sources.LimitBucket{
+			// Use EC2 limits as it's not documented
+			MaxCapacity: 50,
+			RefillRate:  10,
+		}
+
+		networkManagerRateLimit := sources.LimitBucket{
+			// Use EC2 limits as it's not documented
+			MaxCapacity: 50,
+			RefillRate:  10,
+		}
+
+		rateLimitCtx, rateLimitCancel := context.WithCancel(context.Background())
+		defer rateLimitCancel()
+
+		ec2RateLimit.Start(rateLimitCtx)
+		autoScalingRateLimit.Start(rateLimitCtx)
+		iamRateLimit.Start(rateLimitCtx)
+		directConnectRateLimit.Start(rateLimitCtx)
+		networkManagerRateLimit.Start(rateLimitCtx)
+
+		sources := []discovery.Source{
+			// EC2
+			ec2.NewAddressSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewCapacityReservationFleetSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewCapacityReservationSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewEgressOnlyInternetGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewIamInstanceProfileAssociationSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewImageSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewInstanceEventWindowSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewInstanceSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewInstanceStatusSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewInternetGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewKeyPairSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewLaunchTemplateSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewLaunchTemplateVersionSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewNatGatewaySource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewNetworkAclSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewNetworkInterfacePermissionSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewNetworkInterfaceSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewPlacementGroupSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewReservedInstanceSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewRouteTableSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewSecurityGroupSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewSnapshotSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewSubnetSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewVolumeSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewVolumeStatusSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewVpcPeeringConnectionSource(cfg, *callerID.Account, &ec2RateLimit),
+			ec2.NewVpcSource(cfg, *callerID.Account, &ec2RateLimit),
+
+			// EFS (I'm assuming it shares its rate limit with EC2))
+			efs.NewAccessPointSource(cfg, *callerID.Account, &ec2RateLimit),
+			efs.NewBackupPolicySource(cfg, *callerID.Account, &ec2RateLimit),
+			efs.NewFileSystemSource(cfg, *callerID.Account, &ec2RateLimit),
+			efs.NewMountTargetSource(cfg, *callerID.Account, &ec2RateLimit),
+			efs.NewReplicationConfigurationSource(cfg, *callerID.Account, &ec2RateLimit),
+
+			// EKS
+			eks.NewAddonSource(cfg, *callerID.Account, region),
+			eks.NewClusterSource(cfg, *callerID.Account, region),
+			eks.NewFargateProfileSource(cfg, *callerID.Account, region),
+			eks.NewNodegroupSource(cfg, *callerID.Account, region),
+
+			// Route 53
+			route53.NewHealthCheckSource(cfg, *callerID.Account, region),
+			route53.NewHostedZoneSource(cfg, *callerID.Account, region),
+			route53.NewResourceRecordSetSource(cfg, *callerID.Account, region),
+
+			// Cloudwatch
+			cloudwatch.NewAlarmSource(cfg, *callerID.Account),
+
+			// IAM
+			iam.NewGroupSource(cfg, *callerID.Account, region, &iamRateLimit),
+			iam.NewInstanceProfileSource(cfg, *callerID.Account, region, &iamRateLimit),
+			iam.NewPolicySource(cfg, *callerID.Account, region, &iamRateLimit),
+			iam.NewRoleSource(cfg, *callerID.Account, region, &iamRateLimit),
+			iam.NewUserSource(cfg, *callerID.Account, region, &iamRateLimit),
+
+			// Lambda
+			lambda.NewFunctionSource(cfg, *callerID.Account, region),
+			lambda.NewLayerSource(cfg, *callerID.Account, region),
+			lambda.NewLayerVersionSource(cfg, *callerID.Account, region),
+
+			// ECS
+			ecs.NewCapacityProviderSource(cfg, *callerID.Account),
+			ecs.NewClusterSource(cfg, *callerID.Account, region),
+			ecs.NewContainerInstanceSource(cfg, *callerID.Account, region),
+			ecs.NewServiceSource(cfg, *callerID.Account, region),
+			ecs.NewTaskDefinitionSource(cfg, *callerID.Account, region),
+			ecs.NewTaskSource(cfg, *callerID.Account, region),
+
+			// DynamoDB
+			dynamodb.NewBackupSource(cfg, *callerID.Account, region),
+			dynamodb.NewTableSource(cfg, *callerID.Account, region),
+
+			// RDS
+			rds.NewDBClusterParameterGroupSource(cfg, *callerID.Account, region),
+			rds.NewDBClusterSource(cfg, *callerID.Account),
+			rds.NewDBInstanceSource(cfg, *callerID.Account),
+			rds.NewDBParameterGroupSource(cfg, *callerID.Account, region),
+			rds.NewDBSubnetGroupSource(cfg, *callerID.Account),
+			rds.NewOptionGroupSource(cfg, *callerID.Account),
+
+			// Autoscaling
+			autoscaling.NewAutoScalingGroupSource(cfg, *callerID.Account, &autoScalingRateLimit),
+
+			// ELB
+			elb.NewInstanceHealthSource(cfg, *callerID.Account),
+			elb.NewLoadBalancerSource(cfg, *callerID.Account),
+
+			// ELBv2
+			elbv2.NewListenerSource(cfg, *callerID.Account),
+			elbv2.NewLoadBalancerSource(cfg, *callerID.Account),
+			elbv2.NewRuleSource(cfg, *callerID.Account),
+			elbv2.NewTargetGroupSource(cfg, *callerID.Account),
+			elbv2.NewTargetHealthSource(cfg, *callerID.Account),
+
+			// Network Firewall
+			networkfirewall.NewFirewallSource(cfg, *callerID.Account, region),
+			networkfirewall.NewFirewallPolicySource(cfg, *callerID.Account, region),
+			networkfirewall.NewRuleGroupSource(cfg, *callerID.Account, region),
+			networkfirewall.NewTLSInspectionConfigurationSource(cfg, *callerID.Account, region),
+
+			// Direct Connect
+			directconnect.NewDirectConnectGatewaySource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewDirectConnectGatewayAssociationSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewDirectConnectGatewayAssociationProposalSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewConnectionSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewDirectConnectGatewayAttachmentSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewVirtualInterfaceSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewVirtualGatewaySource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewCustomerMetadataSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewLagSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewLocationSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewHostedConnectionSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewInterconnectSource(cfg, *callerID.Account, &directConnectRateLimit),
+			directconnect.NewRouterConfigurationSource(cfg, *callerID.Account, &directConnectRateLimit),
+
+			// Network Manager
+			networkmanager.NewGlobalNetworkSource(cfg, *callerID.Account, region),
+			networkmanager.NewSiteSource(cfg, *callerID.Account, &networkManagerRateLimit),
+			networkmanager.NewVPCAttachmentSource(cfg, *callerID.Account, &networkManagerRateLimit),
+
+			// SQS
+			sqs.NewQueueSource(cfg, *callerID.Account, region),
+
+			// SNS
+			sns.NewSubscriptionSource(cfg, *callerID.Account, region),
+			sns.NewTopicSource(cfg, *callerID.Account, region),
+			sns.NewPlatformApplicationSource(cfg, *callerID.Account, region),
+			sns.NewEndpointSource(cfg, *callerID.Account, region),
+			sns.NewDataProtectionPolicySource(cfg, *callerID.Account, region),
+		}
+
+		e.AddSources(sources...)
+
+		// Add "global" sources (those that aren't tied to a region, like
+		// cloudfront). but only do this once for the first region. For
+		// these APIs it doesn't matter which region we call them from, we
+		// get global results
+		if !globalDone {
+			e.AddSources(
+				// Cloudfront
+				cloudfront.NewCachePolicySource(cfg, *callerID.Account),
+				cloudfront.NewContinuousDeploymentPolicySource(cfg, *callerID.Account),
+				cloudfront.NewDistributionSource(cfg, *callerID.Account),
+				cloudfront.NewFunctionSource(cfg, *callerID.Account),
+				cloudfront.NewKeyGroupSource(cfg, *callerID.Account),
+				cloudfront.NewOriginAccessControlSource(cfg, *callerID.Account),
+				cloudfront.NewOriginRequestPolicySource(cfg, *callerID.Account),
+				cloudfront.NewResponseHeadersPolicySource(cfg, *callerID.Account),
+				cloudfront.NewRealtimeLogConfigsSource(cfg, *callerID.Account),
+				cloudfront.NewStreamingDistributionSource(cfg, *callerID.Account),
+
+				// S3
+				s3.NewS3Source(cfg, *callerID.Account),
+			)
+			globalDone = true
+		}
+	}
+
+	return e, nil
 }
